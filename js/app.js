@@ -38,7 +38,6 @@ const sources = {
   },
 };
 const getSettings = () => loadSettings(storage);
-const isDevUrl = () => new URLSearchParams(globalThis.location?.search ?? '').get('dev') === '1';
 
 const telemetry = createTelemetry({
   storage,
@@ -887,7 +886,7 @@ function renderSettingsView() {
   const root = h('div', { class: 'view settings' });
   renderSettings(root, {
     storage,
-    isDevUrl: isDevUrl(),
+    isDevUrl: true,
     testScripts: TEST_SCRIPTS,
     onSaved: updateDevBadge,
     onBack: () => go('home'),
