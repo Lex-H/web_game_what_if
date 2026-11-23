@@ -3,7 +3,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node tests/rules.test.js",
+    "test": "node tests/rules.test.js && node tests/engine.test.js && node tests/scripts.test.js",
+    "test:rules": "node tests/rules.test.js",
+    "test:engine": "node tests/engine.test.js",
+    "test:scripts": "node tests/scripts.test.js",
     "serve": "python -m http.server 8000"
   }
 }

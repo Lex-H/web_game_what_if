@@ -3,15 +3,24 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>rules.js 測試中…</title>
+    <title>What If 測試</title>
     <style>
       body { margin: 0; padding: 24px; background: #111; color: #eee; font: 15px/1.6 system-ui, sans-serif; }
       pre { white-space: pre-wrap; }
+      h2 { margin-top: 32px; }
     </style>
   </head>
   <body>
-    <h1>rules.js 測試</h1>
-    <pre id="out">執行中…（如果一直停在這裡，請確認是透過本機伺服器開啟，而不是直接雙擊檔案）</pre>
+    <h1>What If 測試</h1>
+    <p>如果一直停在「執行中」，請確認是透過本機伺服器開啟（npm run serve），而不是直接雙擊檔案。</p>
+    <h2>rules.js（第十六章案例 + 第十一章測試劇本）</h2>
+    <pre id="out">執行中…</pre>
+    <h2>engine.js（完整流程 + 測試劇本逐回合比對）</h2>
+    <pre id="out-engine">執行中…</pre>
+    <h2>可玩劇本（data/script-*.js）</h2>
+    <pre id="out-scripts">執行中…</pre>
     <script type="module" src="./rules.test.js"></script>
+    <script type="module" src="./engine.test.js"></script>
+    <script type="module" src="./scripts.test.js"></script>
   </body>
 </html>

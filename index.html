@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>What If：明天，臺灣被攻佔</title>
+    <meta name="description" content="AI 互動推演遊戲。3 個身份、7 個回合，你的選擇決定結局；3～6 分鐘玩一局。" />
+    <meta name="theme-color" content="#0d1117" />
+    <link rel="icon" href="assets/logo.svg" type="image/svg+xml" />
+
+    <!-- 8.6 OG 預覽：og-image.png 由專案負責人提供（assets/og-image.png）；正式網域確定後，og:image 與 og:url 請改為絕對網址 -->
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="What If：明天，臺灣被攻佔" />
+    <meta property="og:description" content="AI 互動推演遊戲。3 個身份、7 個回合，你的選擇決定結局；3～6 分鐘玩一局。" />
+    <meta property="og:image" content="assets/og-image.png" />
+    <meta property="og:locale" content="zh_TW" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="What If：明天，臺灣被攻佔" />
+    <meta name="twitter:description" content="AI 互動推演遊戲。3 個身份、7 個回合，你的選擇決定結局；3～6 分鐘玩一局。" />
+    <meta name="twitter:image" content="assets/og-image.png" />
+
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div id="dev-badge" class="dev-badge" hidden>DEV</div>
+    <div id="app" class="app" aria-live="off"></div>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <noscript><p class="noscript">這個遊戲需要啟用 JavaScript 才能遊玩。</p></noscript>
+
+    <!-- 自行託管、固定版本 1.4.1（14.1）；載入失敗時分享流程會降級為只複製文字 -->
+    <script src="js/vendor/html2canvas.min.js"></script>
+    <script type="module" src="js/app.js"></script>
+  </body>
+</html>
