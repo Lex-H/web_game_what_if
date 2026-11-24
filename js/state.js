@@ -68,23 +68,36 @@ export function hasResumableGame(storage) {
 // ─── 設定（9.3、14.2） ────────────────────────────────────────
 
 export const DEFAULT_SETTINGS = Object.freeze({
-  // 第二階段只有劇本模式可用；official / dev 在第三、四階段實作
-  aiMode: 'script', // official | dev | script
-  provider: 'gemini',
-  model: 'gemini-3.1-flash-lite',
+  // 改版1：一律先用 Grok，失敗才改用 Gemini，所以兩家的 Key 分開存；有任一把 Key，劇本模式就會呼叫 AI
+  keys: Object.freeze({ xai: '', gemini: '' }),
+  models: Object.freeze({ xai: '', gemini: '' }), // 空字串 = 使用供應商預設模型
   baseUrl: 'official', // 白名單 key（9.3），不存任意網址
-  apiKey: '',
-  devEnabled: false, // 9.2：在開發者區塊手動開啟並儲存後才生效
-  testScriptId: '', // 強制 Mock 劇本：test_clear / test_fail_score / test_fail_fatal
+  devEnabled: false, // 顯示開發者細節、不送遙測
+  testScriptId: '', // 強制 Mock 劇本（只影響劇本模式）：test_clear / test_fail_score / test_fail_fatal
   voice: true,
+  theme: 'dark', // dark | bright
 });
 
+/**
+ * 補齊預設值，並把舊版的單一 apiKey / model / provider 搬進 keys / models。
+ * 有 apiKey 欄位（含空字串）代表呼叫端要設定它，空字串即清除該供應商的 Key。
+ */
+export function normalizeSettings(raw = {}) {
+  const { apiKey, model, provider, ...rest } = raw ?? {};
+  const legacy = provider === 'xai' ? 'xai' : 'gemini';
+  const keys = { ...DEFAULT_SETTINGS.keys, ...rest.keys };
+  const models = { ...DEFAULT_SETTINGS.models, ...rest.models };
+  if (typeof apiKey === 'string') keys[legacy] = apiKey;
+  if (typeof model === 'string' && model) models[legacy] = model;
+  return { ...DEFAULT_SETTINGS, ...rest, keys, models };
+}
+
 export function loadSettings(storage) {
-  return { ...DEFAULT_SETTINGS, ...(readJSON(storage, KEYS.settings) ?? {}) };
+  return normalizeSettings(readJSON(storage, KEYS.settings) ?? {});
 }
 
 export function saveSettings(storage, settings) {
-  const clean = { ...DEFAULT_SETTINGS, ...settings };
+  const clean = normalizeSettings(settings);
   storage.setItem(KEYS.settings, JSON.stringify(clean));
   return clean;
 }

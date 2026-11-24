@@ -7,8 +7,8 @@
  * - 只有 render() 在狀態變動或換頁時重建 DOM；輸入框字數、選單展開等用直接操作 DOM，避免打斷輸入。
  */
 import { GameController, optionAction, freeAction, buildShareText, timeLabel, lastRejections, BADGE_LABELS, END_TYPE_LABELS, FREE_ACTION_MAX } from './engine.js';
-import { createScriptSource, createUnavailableSource, createDevSource, ERROR_CODES } from './api.js';
-import { defaultStorage, loadSettings, loadGame, hasResumableGame } from './state.js';
+import { createScriptSource, createUnavailableSource, createDevSource, availableProviders, ERROR_CODES } from './api.js';
+import { defaultStorage, loadSettings, saveSettings, loadGame, hasResumableGame } from './state.js';
 import {
   SCENARIOS, CHARACTERS, EVENTS, LOCATIONS, HOME_COPY, DISCLAIMER, PRIVACY_NOTICE, RESOURCES, STAT_LABELS,
   supplyLabel, TRANSPORT_LABELS, CONTACT_LABELS, ORDER_LABELS, MILESTONE_STATUS_LABELS, EVENT_TYPE_LABELS,
@@ -20,6 +20,7 @@ import { TEST_SCRIPTS } from '../data/script-tests.js';
 import { h, clear } from './dom.js';
 import { createTelemetry } from './telemetry.js';
 import { renderSettings } from './settings.js';
+import { applyTheme } from './theme.js';
 import { createRecognizer, isSpeechAvailable, SPEECH_ERROR_MESSAGES } from './speech.js';
 import { buildShareCard, renderCardPng, runShareFlow, openModal, trajectoryBlocks, symbolClass, symbolName } from './share.js';
 
@@ -51,6 +52,7 @@ const controller = new GameController({ storage, sources, testScripts: TEST_SCRI
 const ui = {
   view: 'home', // home | disclaimer | character | game | result | settings | resume
   scenarioId: DEFAULT_SCENARIO_ID,
+  flow: 'dynamic', // 首頁選的玩法：classic（劇本模式）| dynamic（AI 動態模式），預設 dynamic
   disclaimerOk: false,
   randomCharacterId: null,
   busy: false, // 送出行動後到最短等待時間結束之前
@@ -67,6 +69,7 @@ const ui = {
   listening: false,
   replayFrom: null,
   pendingCharacterId: null,
+  settleError: null,
 };
 let waitTimer = null;
 let recognizer = null;
@@ -80,12 +83,13 @@ const STYLE_LABELS = { steady: '穩健', intel: '情報', bold: '冒險' };
 const RISK_LABELS = { none: '無', minor: '輕微', major: '重大', fatal: '致命' };
 const PERF_LABELS = { excellent: '精彩', good: '良好', neutral: '普通', poor: '失誤' };
 const MS_ICON = { none: '○', partial: '◐', done: '✓', lost: '✕' };
+const MORAL_LABELS = { selfish: '手段自私', ruthless: '手段冷酷' };
 const signed = (n) => (n > 0 ? `+${n}` : String(n));
 
 const modeLabel = (s) => {
   if (s.testScriptId) return '劇本模式（測試）';
-  if (s.mode === 'script') return '劇本模式';
-  return s.mode === 'dev' ? '開發者 AI 模式' : '即時 AI 推演';
+  if (s.flow === 'dynamic') return 'AI 動態模式';
+  return s.mode === 'script' ? '劇本模式' : '劇本模式・AI 推演';
 };
 
 function msName(characterId, id) {
@@ -101,14 +105,14 @@ function errorInfo(err) {
   const table = {
     timeout: { text: '這次推演等太久了，沒有收到回應。你的進度已保存。', retry: true },
     schema: { text: '回應的格式不正確，本回合沒有套用任何變更。', retry: true },
-    refusal: { text: '這次的推演被拒絕了。可以重試，或本回合改用劇本。', retry: true },
+    refusal: { text: '這次的推演被 AI 拒絕了。可以重試，或取消後換個行動。', retry: true },
     provider: { text: '推演服務暫時出了問題。', retry: true },
     network: { text: '網路連線似乎中斷了。', retry: true },
     interrupted: { text: '上次的推演被中斷了，進度已保存。', retry: true },
-    auth: { text: '推演服務認證失敗，請改用劇本模式。', retry: false },
-    budget: { text: '今日即時推演額度已滿，本回合改用劇本模式繼續。', retry: false },
-    rate_limit: { text: '請求太頻繁，請稍後再試，或本回合改用劇本。', retry: true },
-    not_available: { text: err?.message || '這個模式尚未開放，請改用劇本模式。', retry: false },
+    auth: { text: 'Grok 與 Gemini 的 API Key 都無法使用，請到設定頁檢查 Key。', retry: false },
+    budget: { text: '今日即時推演額度已滿。', retry: false },
+    rate_limit: { text: '請求太頻繁或額度已用完，請稍後再試。', retry: true },
+    not_available: { text: err?.message || '這個模式尚未開放。', retry: false },
   };
   const info = table[code] ?? { text: '發生未預期的錯誤。', retry: true };
   return { title: base, ...info };
@@ -187,10 +191,28 @@ const WAIT_LINES = {
     '干擾強度上升，切換備用頻道…',
   ],
   settle: ['正在整理這一局的紀錄…', '回顧每一個關鍵時刻…', '寫下你的評語…'],
+  // AI 動態模式：詼諧黑色幽默，只調侃荒謬的處境，不拿傷亡開玩笑
+  civilian_dynamic: [
+    '收音機：「請保持冷靜。」你：（保持中）',
+    '手機顯示 1 格訊號，然後 0 格，然後 1 格…',
+    '鄰居群組又有人轉傳「內部消息」…',
+    '命運正在翻你的簿子，請稍候…',
+    '你的冷靜正在載入，目前 87%…',
+    '省電模式已開啟，樂觀模式尚未支援…',
+  ],
+  vp_dynamic: [
+    '幕僚正在把壞消息改寫成「挑戰」…',
+    '加密線路同步中（希望只有我方在聽）…',
+    '各方「高度關切」正在排隊等你回電…',
+    '命運正在翻你的簿子，請稍候…',
+    '通訊兵：「報告，線路……還是沒通。」',
+    '正在起草一份誰都不想簽的聲明…',
+  ],
+  settle_dynamic: ['正在清點你這一局做過的好事與壞事…', '把你的每個決定攤開來對帳…', '評語正在醞釀，請先做好心理準備…'],
 };
 
-function renderWaiting(kind) {
-  const lines = WAIT_LINES[kind] ?? WAIT_LINES.civilian;
+function renderWaiting(kind, dynamic = false) {
+  const lines = (dynamic ? WAIT_LINES[`${kind}_dynamic`] : null) ?? WAIT_LINES[kind] ?? WAIT_LINES.civilian;
   const line = h('p', { class: 'wait-line', role: 'status', 'aria-live': 'polite', text: lines[ui.waitIdx % lines.length] });
   clearInterval(waitTimer);
   waitTimer = setInterval(() => {
@@ -205,8 +227,52 @@ function renderWaiting(kind) {
 
 // ─── 首頁 ─────────────────────────────────────────────────────
 
+const MODES = Object.freeze([
+  { flow: 'dynamic', title: 'AI 動態模式', desc: '每回合的劇情與選項由 AI 即時生成，帶點黑色幽默，還有你看不見的運氣。手段再髒也能過關，但代價會算在你頭上。需要設定 API Key。' },
+  { flow: 'classic', title: '劇本模式', desc: '經典版本：手寫劇情與固定事件，語氣嚴肅。有設定 API Key 時，自由輸入的行動會交給 AI 判定。' },
+]);
+
+const isOnline = () => navigator.onLine !== false;
+
+/** 開始遊戲前的檢查；通過回傳 null，不通過回傳要告訴玩家的說明 */
+function modeBlocker(flow) {
+  const settings = getSettings();
+  const offlineOk = flow === 'classic' && settings.testScriptId; // 強制 Mock 測試劇本不會連網
+  if (!isOnline() && !offlineOk) {
+    return { title: '目前沒有網路連線', body: '兩種模式開始前都需要連上網路：劇本模式的自由輸入與評語、AI 動態模式的全部內容都會呼叫 AI。請連上網路後再開始。' };
+  }
+  if (flow === 'dynamic' && !availableProviders(settings).length) {
+    return { title: 'AI 動態模式需要 API Key', body: '這個模式的劇情由 AI 即時生成，請先到設定頁填入 Grok 或 Gemini 的 API Key。', toSettings: true };
+  }
+  return null;
+}
+
+function guardMode(flow) {
+  const blocker = modeBlocker(flow);
+  if (!blocker) return true;
+  openModal({
+    title: blocker.title,
+    body: h('p', { text: blocker.body }),
+    actions: [
+      ...(blocker.toSettings ? [{ label: '前往設定', primary: true, onClick: ({ close }) => { close(); go('settings'); } }] : []),
+      { label: '知道了', primary: !blocker.toSettings, onClick: ({ close }) => close() },
+    ],
+  });
+  return false;
+}
+
 function renderHome() {
   const openScenarios = SCENARIOS.filter((s) => s.open);
+  const online = isOnline();
+  const modeCards = MODES.map((m) => h('button', {
+    type: 'button',
+    class: `mode-card${m.flow === ui.flow ? ' selected' : ''}`,
+    aria: { pressed: String(m.flow === ui.flow) },
+    onclick: () => { ui.flow = m.flow; render(); },
+  },
+    h('span', { class: 'mode-title', text: m.title }),
+    h('span', { class: 'mode-desc', text: m.desc }),
+  ));
   const cards = SCENARIOS.map((sc) => {
     const selected = sc.open && sc.id === ui.scenarioId;
     return h('button', {
@@ -236,13 +302,18 @@ function renderHome() {
       h('p', { class: 'hero-sub', text: HOME_COPY.subtitle }),
       h('p', { class: 'hero-intro', text: HOME_COPY.intro }),
     ),
+    online ? null : h('p', { class: 'warning', role: 'alert', text: '目前沒有偵測到網路連線，請連上網路後再開始遊戲。' }),
+    h('p', { class: 'section-label', text: '選擇玩法' }),
+    h('section', { class: 'mode-list', aria: { label: '遊戲模式' } }, ...modeCards),
+    h('p', { class: 'section-label', text: '選擇情境' }),
     h('section', { class: 'scenario-list', aria: { label: '情境' } }, ...cards),
     h('div', { class: 'cta' },
-      h('button', { type: 'button', class: 'btn btn-primary btn-lg', text: HOME_COPY.start, onclick: () => { ui.randomCharacterId = null; startFlow(); } }),
+      h('button', { type: 'button', class: 'btn btn-primary btn-lg', text: HOME_COPY.start, disabled: !online && !getSettings().testScriptId, onclick: () => { ui.randomCharacterId = null; startFlow(); } }),
       h('button', {
         type: 'button',
         class: 'btn btn-ghost btn-lg',
         text: HOME_COPY.random,
+        disabled: !online && !getSettings().testScriptId,
         onclick: () => {
           // 只從已開放情境抽，再隨機抽角色
           const sc = openScenarios[Math.floor(Math.random() * openScenarios.length)];
@@ -257,6 +328,7 @@ function renderHome() {
 }
 
 function startFlow() {
+  if (!guardMode(ui.flow)) return;
   if (!ui.disclaimerOk) return go('disclaimer');
   return ui.randomCharacterId ? startGame(ui.randomCharacterId) : go('character');
 }
@@ -289,14 +361,15 @@ function renderDisclaimer() {
 function renderCharacterSelect() {
   const scenario = SCENARIOS.find((s) => s.id === ui.scenarioId);
   const settings = getSettings();
-  const forced = settings.devEnabled && settings.testScriptId ? TEST_SCRIPTS[settings.testScriptId] : null;
+  const forced = settings.testScriptId ? TEST_SCRIPTS[settings.testScriptId] : null;
   return h('div', { class: 'view' },
     h('div', { class: 'page-head' },
       h('button', { type: 'button', class: 'btn btn-ghost btn-sm', text: '返回', onclick: () => go('home') }),
       h('h1', { class: 'page-title', text: '選擇你的身份' }),
     ),
     h('p', { class: 'muted', text: `《${scenario.title}》` }),
-    forced ? h('p', { class: 'warning', text: `開發者：已強制使用測試劇本「${forced.title ?? settings.testScriptId}」，角色與事件排程由測試劇本決定。` }) : null,
+    ui.flow === 'dynamic' ? h('p', { class: 'muted small', text: 'AI 動態模式：每回合的劇情與選項由 AI 即時生成，結果帶有你看不見的運氣成分。' }) : null,
+    forced && ui.flow === 'classic' ? h('p', { class: 'warning', text: `測試功能：已強制使用測試劇本「${forced.title ?? settings.testScriptId}」，角色與事件排程由測試劇本決定。` }) : null,
     ...scenario.characters.map((id) => {
       const c = CHARACTERS[id];
       return h('article', { class: 'card char-card' },
@@ -462,7 +535,6 @@ function renderLastResult(s) {
     r.scoreReason ? h('p', { class: 'score-reason', text: `計分原因：${r.scoreReason}` }) : null,
     changes.length ? h('ul', { class: 'changes' }, ...changes) : null,
     h('p', { class: 'muted small', text: `表現：${PERF_LABELS[r.performance?.applied] ?? '-'}（${signed(r.performance?.points ?? 0)}）　風險：${RISK_LABELS[risk]}${r.frozen ? '（本回合變更未套用）' : ''}　${ch.name}` }),
-    r.source === 'script' && s.mode !== 'script' && !s.testScriptId ? h('p', { class: 'muted small', text: '本回合由劇本模式推演。' }) : null,
     isDev() ? renderDevBox(s, r) : null,
   );
 }
@@ -578,6 +650,36 @@ function renderFreeAction(s) {
   );
 }
 
+function abandonButton() {
+  return h('button', {
+    type: 'button',
+    class: 'btn btn-danger',
+    text: '放棄本局',
+    onclick: () => openModal({
+      title: '確定放棄這一局？',
+      body: h('p', { text: '這一局的進度會被刪除，回到首頁。' }),
+      actions: [
+        { label: '放棄本局', primary: true, onClick: ({ close }) => { close(); ui.settleError = null; controller.abandon(); go('home'); } },
+        { label: '繼續這一局', onClick: ({ close }) => close() },
+      ],
+    }),
+  });
+}
+
+/** AI 動態模式的結算評語失敗：不用罐頭評語頂替，讓玩家重試或放棄 */
+function renderSettleError(s) {
+  const info = errorInfo(ui.settleError);
+  return h('section', { class: 'card error-card', role: 'alert' },
+    h('h2', { class: 'card-title', text: `結算評語失敗：${info.title}` }),
+    h('p', { text: info.text }),
+    isDev() ? h('p', { class: 'mono small', text: `[dev] code=${ui.settleError.code} message=${ui.settleError.message}` }) : null,
+    h('div', { class: 'cta' },
+      h('button', { type: 'button', class: 'btn btn-primary', text: '重試結算', onclick: () => { ui.settleError = null; runSettle(); } }),
+      abandonButton(),
+    ),
+  );
+}
+
 function renderErrorPanel(s) {
   const info = errorInfo(s.lastError);
   const pending = s.pendingAction;
@@ -588,8 +690,8 @@ function renderErrorPanel(s) {
     isDev() && s.lastError ? h('p', { class: 'mono small', text: `[dev] code=${s.lastError.code} message=${s.lastError.message}` }) : null,
     h('div', { class: 'cta' },
       info.retry && pending ? h('button', { type: 'button', class: 'btn btn-primary', text: '重試', onclick: () => submit(() => controller.retry()) }) : null,
-      pending ? h('button', { type: 'button', class: `btn ${info.retry ? 'btn-ghost' : 'btn-primary'}`, text: '本回合改用劇本', onclick: () => submit(() => controller.useScriptThisRound()) }) : null,
-      h('button', { type: 'button', class: 'btn btn-ghost', text: '取消', onclick: () => controller.cancelPending() }),
+      h('button', { type: 'button', class: 'btn btn-ghost', text: '取消，換個行動', onclick: () => controller.cancelPending() }),
+      abandonButton(),
     ),
   );
 }
@@ -631,10 +733,14 @@ function historyList(s) {
 function renderGame() {
   const s = controller.state;
   const kind = (s?.characterId ?? ui.pendingCharacterId) === 'vp' ? 'vp' : 'civilian';
+  if (s && ui.settleError && !ui.settling) {
+    return h('div', { class: 'view game' }, renderHud(s), h('main', { class: 'content' }, renderSettleError(s)));
+  }
   if (!s || ui.busy || ui.settling || s.phase === 'awaiting_ai' || ['ended', 'settled'].includes(s.phase)) {
     if (s && !ui.busy && !ui.settling && ['ended', 'settled'].includes(s.phase)) queueMicrotask(runSettle);
     const ending = s && (ui.settling || ['ended', 'settled'].includes(s.phase));
-    return h('div', { class: 'view game' }, s ? renderHud(s) : null, h('main', { class: 'content' }, renderWaiting(ending ? 'settle' : kind)));
+    const dynamic = (s?.flow ?? ui.flow) === 'dynamic';
+    return h('div', { class: 'view game' }, s ? renderHud(s) : null, h('main', { class: 'content' }, renderWaiting(ending ? 'settle' : kind, dynamic)));
   }
   if (ui.lastRound !== s.round) {
     ui.lastRound = s.round;
@@ -678,9 +784,10 @@ async function submit(runner) {
   render();
 }
 
-async function startGame(characterId) {
+async function startGame(characterId, { flow = ui.flow } = {}) {
+  if (!guardMode(flow)) return;
+  ui.flow = flow;
   const settings = getSettings();
-  const dev = settings.devEnabled;
   if (ui.replayFrom) {
     // 「換個身份再玩」：選角後才知道是否更換角色（12.1 replay）
     track('replay', { changed_character: ui.replayFrom !== characterId });
@@ -696,20 +803,31 @@ async function startGame(characterId) {
   ui.rated = null;
   ui.pngPromise = null;
   ui.waitIdx = 0;
+  ui.settleError = null;
   ui.view = 'game';
   ui.busy = true;
   render();
   try {
     await controller.start({
       characterId,
-      // 第二階段官方 AI 尚未開放，一般玩家先用 'script'；第四階段改為 'official'。
-      mode: dev ? settings.aiMode : 'script',
-      testScriptId: dev ? settings.testScriptId : '',
+      flow,
+      // 有任何一把 Key 就用 AI（Grok 優先、Gemini 備援）；完全沒有 Key 的劇本模式直接用劇本內容
+      mode: availableProviders(settings).length ? 'dev' : 'script',
+      testScriptId: flow === 'classic' ? settings.testScriptId : '',
     });
   } catch (e) {
     console.error('[app] start failed', e);
     ui.busy = false;
-    toast('無法開始遊戲，請重新整理後再試');
+    const info = e?.code ? errorInfo(e) : null;
+    openModal({
+      title: flow === 'dynamic' ? 'AI 動態模式無法開始' : '無法開始遊戲',
+      body: h('div', { class: 'share-modal-body' },
+        h('p', { text: info ? `${info.title}：${info.text}` : '請重新整理後再試。' }),
+        e?.message ? h('p', { class: 'muted small', text: e.message }) : null,
+        h('p', { class: 'muted small', text: '你可以回到首頁重新開始，或改選另一個玩法。' }),
+      ),
+      actions: [{ label: '回首頁', primary: true, onClick: ({ close }) => close() }],
+    });
     go('home');
     return;
   }
@@ -735,7 +853,7 @@ async function runSettle() {
   if (!controller.state?.testScriptId) await sleep(Math.max(0, 1000 - (Date.now() - t0)));
   ui.settling = false;
   if (!result) {
-    toast('結算失敗，請重新整理');
+    ui.settleError = controller.state?.lastError ?? { code: 'provider', message: '結算失敗' };
     return render();
   }
   ui.settlement = result;
@@ -780,6 +898,7 @@ function renderResult() {
   const last = controller.lastRecord;
   const cleared = s.endType === 'clear';
   const sourceLabel = ['script', 'test'].includes(st.commentSource) ? '劇本評語' : 'AI 評語';
+  const taintedLabel = cleared ? MORAL_LABELS[st.moral] : null;
 
   const rate = (value) => {
     if (ui.rated) return;
@@ -803,8 +922,10 @@ function renderResult() {
         h('span', { class: `chip end-${s.endType}`, text: `${END_TYPE_LABELS[s.endType] ?? ''}・第 ${s.endRound} 回合` }),
         cleared && st.rating ? h('span', { class: 'chip grade', text: `評級 ${st.rating.grade}` }) : null,
         ...(st.rating?.badges ?? []).map((b) => h('span', { class: 'chip badge', text: BADGE_LABELS[b] ?? b })),
+        taintedLabel ? h('span', { class: 'chip tainted', text: taintedLabel }) : null,
       ),
       cleared && st.rating ? h('p', { class: 'muted small', text: `評級依表現分與風險分合計（${signed(st.rating.total)}）計算` }) : null,
+      taintedLabel ? h('p', { class: 'muted small', text: '通關了，但這個「成功」附帶條件：你是怎麼走到這一步的，也一併記進了結局。' }) : null,
     ),
     last ? h('section', { class: 'card' },
       h('h2', { class: 'card-title', text: `最後一回合（第 ${last.round} 回合）` }),
@@ -842,7 +963,7 @@ function renderResult() {
         type: 'button',
         class: 'btn btn-ghost btn-lg',
         text: `再玩一次（${ch.name}）`,
-        onclick: () => { track('replay', { changed_character: false }); startGame(s.characterId); },
+        onclick: () => { track('replay', { changed_character: false }); startGame(s.characterId, { flow: s.flow ?? 'classic' }); },
       }),
       h('button', {
         type: 'button',
@@ -857,6 +978,7 @@ function renderResult() {
 
 function replayWithOtherCharacter() {
   const prev = controller.state?.characterId;
+  ui.flow = controller.state?.flow ?? 'classic';
   ui.replayFrom = prev;
   controller.abandon();
   ui.settlement = null;
@@ -886,7 +1008,6 @@ function renderSettingsView() {
   const root = h('div', { class: 'view settings' });
   renderSettings(root, {
     storage,
-    isDevUrl: true,
     testScripts: TEST_SCRIPTS,
     onSaved: updateDevBadge,
     onBack: () => go('home'),
@@ -935,7 +1056,119 @@ function showFatal(errors) {
   ));
 }
 
-function boot() {
+function showKeyGate(onContinue) {
+  const makeKeyRow = (id, label) => {
+    const input = h('input', {
+      class: 'input',
+      type: 'password',
+      autocomplete: 'off',
+      autocapitalize: 'off',
+      spellcheck: false,
+      placeholder: '貼上你的 API Key',
+      'data-key-id': id,
+    });
+    const show = h('button', {
+      type: 'button',
+      class: 'btn btn-ghost btn-sm',
+      text: '顯示',
+      onclick: () => {
+        const hidden = input.type === 'password';
+        input.type = hidden ? 'text' : 'password';
+        show.textContent = hidden ? '隱藏' : '顯示';
+      },
+    });
+    return h('label', { class: 'field' },
+      h('span', { class: 'field-label', text: `${label} API Key` }),
+      h('div', { class: 'row' }, input, show),
+    );
+  };
+
+  const grokRow = makeKeyRow('xai', 'Grok（xAI）');
+  const geminiRow = makeKeyRow('gemini', 'Gemini（Google）');
+  const errMsg = h('p', { class: 'muted small', role: 'alert', style: { color: 'var(--color-danger, #c0392b)', display: 'none' } });
+
+  const startBtn = h('button', {
+    type: 'button',
+    class: 'btn btn-primary',
+    text: '開始遊玩',
+    onclick: () => {
+      const grokVal = grokRow.querySelector('input').value.trim();
+      const geminiVal = geminiRow.querySelector('input').value.trim();
+      if (!grokVal && !geminiVal) {
+        errMsg.textContent = '請至少填入一把 API Key（Grok 或 Gemini）才能開始。';
+        errMsg.style.display = '';
+        return;
+      }
+      const current = getSettings();
+      const keys = { ...current.keys };
+      if (grokVal) keys.xai = grokVal;
+      if (geminiVal) keys.gemini = geminiVal;
+      saveSettings(storage, { ...current, keys });
+      backdrop.remove();
+      onContinue();
+    },
+  });
+
+  const settingsBtn = h('button', {
+    type: 'button',
+    class: 'btn btn-ghost',
+    text: '進入完整設定',
+    onclick: () => {
+      backdrop.remove();
+      // 跳設定頁；儲存 Key 後 onSaved 會觸發，若有 Key 就解鎖
+      ui.view = 'settings';
+      const origOnSaved = updateDevBadge;
+      // 覆寫一次性的 onSaved callback：有 Key 就繼續 boot
+      const guardedOnSaved = (saved) => {
+        origOnSaved(saved);
+        if (availableProviders(saved).length) {
+          document.getElementById('key-gate-backdrop')?.remove();
+          onContinue();
+        }
+      };
+      render();
+      // 把設定頁的 onSaved 換成帶閘門解鎖的版本
+      const settingsRoot = document.querySelector('.view.settings');
+      if (settingsRoot) {
+        renderSettings(settingsRoot, {
+          storage,
+          testScripts: TEST_SCRIPTS,
+          onSaved: guardedOnSaved,
+          onBack: () => {
+            if (!availableProviders(getSettings()).length) {
+              showKeyGate(onContinue);
+            } else {
+              go('home');
+            }
+          },
+          toast,
+        });
+      }
+    },
+  });
+
+  const backdrop = h('div', {
+    id: 'key-gate-backdrop',
+    class: 'modal-backdrop',
+    role: 'dialog',
+    'aria-modal': 'true',
+    'aria-label': '輸入 API Key 才能開始遊玩',
+  },
+    h('div', { class: 'modal card' },
+      h('h2', { class: 'card-title', text: '《What If》需要 API Key 才能遊玩' }),
+      h('p', { class: 'muted small', text: '本遊戲的劇情由 AI 即時生成，需要 Grok 或 Gemini 的 API Key。兩把都填最穩，只填一把也可以。Key 只存在你的瀏覽器，不會上傳。' }),
+      grokRow,
+      geminiRow,
+      errMsg,
+      h('div', { class: 'row' }, startBtn, settingsBtn),
+    ),
+  );
+
+  document.body.append(backdrop);
+  grokRow.querySelector('input').focus();
+}
+
+function continueBoot() {
   const errors = validateScenarios(); // 2.2：設定檔有錯就拒絕啟動
   if (errors.length) {
     console.error('[What If] validateScenarios 失敗：', errors);
@@ -961,6 +1194,17 @@ function boot() {
     }
   }
   render();
+}
+
+function boot() {
+  applyTheme(getSettings().theme);
+  // 網路狀態改變時，首頁要立刻更新「離線」提示與按鈕
+  for (const type of ['online', 'offline']) window.addEventListener(type, () => { if (ui.view === 'home') render(); });
+  if (!availableProviders(getSettings()).length) {
+    showKeyGate(continueBoot);
+    return;
+  }
+  continueBoot();
 }
 
 boot();

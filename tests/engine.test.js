@@ -7,7 +7,7 @@
  *
  * 執行：npm test（或 node tests/engine.test.js）
  */
-import { createScriptSource, createUnavailableSource, matchStyle } from '../js/api.js';
+import { createScriptSource, createUnavailableSource, matchStyle, SourceError } from '../js/api.js';
 import { buildShareText, freeAction, GameController, optionAction, sanitizeFreeAction } from '../js/engine.js';
 import { FATAL_TITLE, SCORE_FAIL_TITLE } from '../js/rules.js';
 import { CHARACTERS, validateScenarios } from '../js/scenarios.js';
@@ -60,18 +60,65 @@ function tinyScript(characterId) {
   };
 }
 
-function makeController({ storage = memoryStorage(), official = createUnavailableSource('official') } = {}) {
-  const scripts = Object.fromEntries(Object.keys(CHARACTERS).map((id) => [id, tinyScript(id)]));
+const tinyScripts = () => Object.fromEntries(Object.keys(CHARACTERS).map((id) => [id, tinyScript(id)]));
+
+function makeController({ storage = memoryStorage(), official = createUnavailableSource('official'), dev = createUnavailableSource('dev'), rng = seeded(42) } = {}) {
   const events = [];
   const controller = new GameController({
     storage,
-    sources: { script: createScriptSource(scripts), official, dev: createUnavailableSource('dev') },
+    sources: { script: createScriptSource(tinyScripts()), official, dev },
     testScripts: TEST_SCRIPTS,
     telemetry: (name, fields) => events.push({ name, fields }),
-    rng: seeded(42),
+    rng,
   });
   return { controller, storage, events };
 }
+
+// ─── AI 動態模式用的假 AI 來源 ────────────────────────────────
+
+const AI_OPTIONS = [
+  { text: '趁亂搬走最後一箱水', style: 'bold' },
+  { text: '打聽哪裡還有物資', style: 'intel' },
+  { text: '先躲在店裡觀察', style: 'steady' },
+];
+const NEXT_OPTIONS = [
+  { text: '再搬一箱', style: 'bold' },
+  { text: '問問排隊的人', style: 'intel' },
+  { text: '裝作什麼都沒發生', style: 'steady' },
+];
+const dynResponse = (extra = {}) => ({
+  narrative: '你把最後一箱水藏進倉庫，對排隊的老太太說賣完了。'.repeat(3),
+  milestone_updates: [],
+  performance: 'good',
+  risk_event: { level: 'fatal', event_id: null },
+  score_reason: '有效，但很缺德',
+  stat_changes: { calm: 0, intel: 0, execution: 0 },
+  world_state_changes: [],
+  round_summary: '藏起最後一箱水',
+  options: NEXT_OPTIONS,
+  moral_tag: 'cruel',
+  ...extra,
+});
+
+function fakeAI({ opening, round, settle } = {}) {
+  const calls = { opening: 0, round: [], settle: 0 };
+  const src = {
+    name: 'dev',
+    opening: async (state) => { calls.opening += 1; return opening ? opening(state) : { opening: 'AI 開場', options: AI_OPTIONS }; },
+    round: async (state, action) => {
+      calls.round.push({ dice: structuredClone(state.pendingDice), action });
+      return round ? round(state, action, calls.round.length) : dynResponse();
+    },
+    settle: async (state) => {
+      calls.settle += 1;
+      return settle ? settle(state, calls.settle) : { personal_comment: 'AI 評語', highlight_round: 1, highlight_action: '藏水' };
+    },
+  };
+  return { src, calls };
+}
+
+/** 固定落在「平」：風險上限 minor */
+const neutralRng = () => 0.5;
 
 function seeded(seed) {
   let s = seed >>> 0;
@@ -190,7 +237,7 @@ await test('等待 AI 時重新整理 → 進入錯誤狀態，保留待送出�
   eq(again.state.round, 2);
 });
 
-await test('官方模式尚未開放：錯誤後狀態不變，可改用劇本完成本回合（10.5、11.1）', async () => {
+await test('官方模式尚未開放：錯誤後狀態不變，只能重試或取消重選（不會偷換成劇本）', async () => {
   const { controller, events } = makeController();
   await controller.start({ characterId: 'office', mode: 'official' });
   ok(controller.state.scene.opening.includes('劇本第 1 回合'), '開場改用劇本節點');
@@ -202,9 +249,9 @@ await test('官方模式尚未開放：錯誤後狀態不變，可改用劇本�
     JSON.stringify({ ...JSON.parse(before), aiErrors: 0 }), '分數與世界狀態不變');
   ok(events.some((e) => e.name === 'ai_error'), '送出 ai_error 遙測');
 
-  const r2 = await controller.useScriptThisRound();
-  ok(r2.ok, '改用劇本');
-  eq([controller.state.round, r2.record.source], [2, 'script']);
+  eq(typeof controller.useScriptThisRound, 'undefined', '已移除「本回合改用劇本」');
+  controller.cancelPending();
+  eq([controller.state.phase, controller.state.pendingAction, controller.state.round], ['awaiting_action', null, 1]);
 });
 
 await test('AI 逾時 → error（timeout），狀態保留', async () => {
@@ -229,16 +276,114 @@ await test('整份拒絕（risk level 為 "critical"）→ 不套用任何內容
   eq([r.error, controller.state.round, controller.state.milestones.m_supplies], ['schema', 1, 'none']);
 });
 
-await test('結算評語失敗時改用劇本評語（7.7）', async () => {
-  const { controller } = makeController();
-  await controller.start({ characterId: 'clerk', mode: 'official' });
-  for (let i = 0; i < 7 && controller.state.phase !== 'ended'; i += 1) {
-    if (controller.state.phase === 'awaiting_action') await controller.act(optionAction(controller.state.scene.options[0], 0));
-    if (controller.state.phase === 'error') await controller.useScriptThisRound();
+await test('劇本模式：結算評語失敗時改用劇本評語（7.7）', async () => {
+  const script = createScriptSource(tinyScripts());
+  const flaky = { ...script, name: 'dev', settle: async () => { throw new SourceError('timeout'); } };
+  const { controller } = makeController({ dev: flaky });
+  await controller.start({ characterId: 'clerk', mode: 'dev' });
+  for (let i = 0; i < 7 && controller.state.phase === 'awaiting_action'; i += 1) {
+    await controller.act(optionAction(controller.state.scene.options[0], 0));
   }
   const st = await controller.settle();
   eq([st.endType, st.commentSource], ['normal', 'script']);
   ok(st.comment.personal_comment, '有評語');
+});
+
+// ─── AI 動態模式（改版1 步驟 4） ──────────────────────────────
+
+await test('AI 動態模式開局：AI 產生開場與選項，不抽事件池', async () => {
+  const ai = fakeAI();
+  const { controller } = makeController({ dev: ai.src, rng: neutralRng });
+  await controller.start({ characterId: 'clerk', mode: 'dev', flow: 'dynamic', testScriptId: 'test_clear' });
+  const s = controller.state;
+  eq([s.flow, s.schedule, s.currentEventId, s.testScriptId, s.scene.opening, s.scene.event], ['dynamic', [], null, '', 'AI 開場', null]);
+  eq(s.scene.options, AI_OPTIONS);
+  eq(ai.calls.opening, 1);
+});
+
+await test('AI 動態模式開局：AI 給的選項不合格 → 用備援選項', async () => {
+  const ai = fakeAI({ opening: () => ({ opening: '開場', options: [{ text: '只有一個', style: 'bold' }] }) });
+  const { controller } = makeController({ dev: ai.src, rng: neutralRng });
+  await controller.start({ characterId: 'clerk', mode: 'dev', flow: 'dynamic' });
+  eq(controller.state.scene.options.length, 3);
+  ok(!controller.state.scene.options.some((o) => o.text === '只有一個'), '不是 AI 的選項');
+});
+
+await test('AI 動態模式開局失敗 → 丟出錯誤、不留下半局', async () => {
+  const ai = fakeAI({ opening: () => { throw new SourceError('auth', '兩家 Key 都無效'); } });
+  const { controller, storage } = makeController({ dev: ai.src });
+  let err = null;
+  try {
+    await controller.start({ characterId: 'clerk', mode: 'dev', flow: 'dynamic' });
+  } catch (e) {
+    err = e;
+  }
+  eq([err?.code, controller.state, storage.getItem('whatif.game.v1')], ['auth', null, null]);
+});
+
+await test('AI 動態模式一回合：先擲骰再呼叫 AI，風險被骰子封頂，道德紀錄累計', async () => {
+  const ai = fakeAI();
+  const { controller } = makeController({ dev: ai.src, rng: neutralRng });
+  await controller.start({ characterId: 'clerk', mode: 'dev', flow: 'dynamic' });
+  const r = await controller.act(optionAction(AI_OPTIONS[0], 0));
+  ok(r.ok, '回合成功');
+  const seen = ai.calls.round[0].dice;
+  eq([seen.tier, seen.riskCeiling], ['neutral', 'minor'], 'AI 收到的骰子');
+  eq(r.record.dice, seen, '紀錄保存骰子');
+  eq([r.record.risk.proposed, r.record.risk.level, r.record.risk.downgraded], ['fatal', 'minor', true]);
+  eq([r.record.moral, controller.state.counters.cruel], ['cruel', 1]);
+  const s = controller.state;
+  eq([s.round, s.pendingDice, s.phase, s.scene.opening], [2, null, 'awaiting_action', '']);
+  eq(s.scene.options, NEXT_OPTIONS, '第 2 回合沿用 AI 給的選項');
+  eq(ai.calls.opening, 1, '第 2 回合不再呼叫開場');
+});
+
+await test('AI 動態模式失敗：重試與取消重選都沿用同一顆骰子', async () => {
+  let x = 0;
+  const rng = () => { x = (x + 0.37) % 1; return x; };
+  const ai = fakeAI({ round: (state, action, n) => { if (n <= 2) throw new SourceError('timeout'); return dynResponse(); } });
+  const { controller } = makeController({ dev: ai.src, rng });
+  await controller.start({ characterId: 'clerk', mode: 'dev', flow: 'dynamic' });
+  const first = await controller.act(optionAction(AI_OPTIONS[0], 0));
+  eq([first.ok, first.error, controller.state.phase], [false, 'timeout', 'error']);
+  ok(controller.state.pendingDice, '失敗後骰子仍保存在狀態裡');
+  await controller.retry();
+  controller.cancelPending();
+  const r = await controller.act(optionAction(AI_OPTIONS[1], 1));
+  ok(r.ok, '第三次成功');
+  const dice = ai.calls.round.map((c) => c.dice);
+  eq(dice[1], dice[0], '重試同一顆');
+  eq(dice[2], dice[0], '取消重選同一顆');
+  eq(r.record.dice, dice[0]);
+});
+
+await test('AI 動態模式結算：失敗不頂替罐頭評語，可重試；稱號與道德評等反映手段', async () => {
+  const ai = fakeAI({
+    round: () => dynResponse({ risk_event: { level: 'none', event_id: null } }),
+    settle: (state, n) => {
+      if (n === 1) throw new SourceError('timeout');
+      return { personal_comment: '水是你的了，良心不是', highlight_round: 1, highlight_action: '藏水' };
+    },
+  });
+  const { controller } = makeController({ dev: ai.src, rng: neutralRng });
+  await controller.start({ characterId: 'clerk', mode: 'dev', flow: 'dynamic' });
+  while (controller.state.phase === 'awaiting_action') {
+    await controller.act(optionAction(controller.state.scene.options[0], 0));
+  }
+  eq(controller.state.phase, 'ended');
+  ok(['normal', 'score'].includes(controller.state.endType), '以 normal 或 score 結束（道德罰分可能讓比賽提前結束）');
+  eq(await controller.settle(), null, '第一次結算失敗');
+  eq([controller.state.phase, controller.state.lastError.code, controller.state.settlement], ['ended', 'timeout', null]);
+  const st = await controller.settle();
+  eq([st.commentSource, st.comment.personal_comment, st.moral, controller.state.phase], ['dev', '水是你的了，良心不是', 'ruthless', 'settled']);
+  eq(controller.state.lastError, null);
+});
+
+await test('劇本模式不擲骰、不記道德', async () => {
+  const { controller } = makeController();
+  await controller.start({ characterId: 'clerk', mode: 'script' });
+  const r = await controller.act(optionAction(controller.state.scene.options[0], 0));
+  eq([controller.state.flow, controller.state.pendingDice, r.record.dice, r.record.moral], ['classic', null, undefined, undefined]);
 });
 
 // ─── 自由行動（6.7、11.2） ─────────────────────────────────────

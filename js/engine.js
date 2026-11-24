@@ -4,10 +4,14 @@
  * GameController 把「AI 來源（api.js）→ 規則引擎（rules.js）→ 保存（state.js）」串起來。
  * 不讀寫 DOM：app.js 只呼叫這裡的方法，並在 onChange 時重新渲染，Node 也能直接測試。
  *
+ * state.flow（玩法，開局後不變）：
+ *   classic  劇本模式：劇本節點開場與選項、固定事件池；玩家行動（含自由輸入）有 Key 時送 AI 判定
+ *   dynamic  AI 動態模式：AI 產生開場、選項與意外；送出行動前先擲命運骰決定風險上限，並累計道德紀錄
+ *
  * state.phase（4.5 的流程狀態，寫入 LocalStorage）：
  *   awaiting_action  等待玩家行動
- *   awaiting_ai      等待 AI 回應（重新整理時視為中斷，進入 error，讓玩家重試或改用劇本）
- *   error            AI 失敗或整份拒絕：重試或本回合改用劇本（10.5）
+ *   awaiting_ai      等待 AI 回應（重新整理時視為中斷，進入 error，讓玩家重試）
+ *   error            AI 失敗或整份拒絕：重試或取消重選（10.5）；不會偷換成劇本內容
  *   ended            遊戲結束，尚未取得結算評語
  *   settled          結算完成，可分享
  */
@@ -18,13 +22,16 @@ import {
   pickEventForRound,
   rejectionNotes,
   resolveRound,
+  rollLuck,
+  sanitizeOptions,
 } from './rules.js';
 import { CHARACTERS, DEFAULT_SCENARIO_ID, EVENT_LIST, EVENTS, LOCATIONS, SCENARIOS, fallbackOptions } from './scenarios.js';
 import { clearGame, loadGame, randomId, saveGame } from './state.js';
 import { SourceError, createTestScriptSource } from './api.js';
 
 export const FREE_ACTION_MAX = 80; // 6.7
-export const AI_TIMEOUT_MS = 25000; // 7.6
+/** 7.6：要大於 api.js 的 PROVIDER_TIMEOUT_MS × 2，Grok 逾時後 Gemini 才有時間接手 */
+export const AI_TIMEOUT_MS = 50000;
 
 /** 控制字元、零寬字元與雙向文字控制字元（提示注入常用來藏指令） */
 const isInvisibleOrControl = (cp) =>
@@ -139,20 +146,23 @@ export class GameController {
   // ─── 開局（1.2 第 1 步） ───────────────────────────────────
 
   /**
-   * @param {{characterId?:string, scenarioId?:string, mode?:string, testScriptId?:string}} params
-   *   testScriptId：開發者「強制 Mock 劇本」，角色與事件排程由測試劇本決定
+   * @param {{characterId?:string, scenarioId?:string, mode?:string, flow?:'classic'|'dynamic', testScriptId?:string}} params
+   *   mode：AI 來源（script / dev / official）
+   *   testScriptId：「強制 Mock 劇本」，只用於 classic，角色與事件排程由測試劇本決定
+   * dynamic 的開場由 AI 產生；失敗時這局不成立，丟出 SourceError 讓畫面說明原因
    */
-  async start({ characterId, scenarioId = DEFAULT_SCENARIO_ID, mode = 'script', testScriptId = '' } = {}) {
-    const testScript = testScriptId ? this.testScripts[testScriptId] : null;
-    if (testScriptId && !testScript) throw new Error(`unknown test script: ${testScriptId}`);
+  async start({ characterId, scenarioId = DEFAULT_SCENARIO_ID, mode = 'script', flow = 'classic', testScriptId = '' } = {}) {
+    const dynamic = flow === 'dynamic';
+    const testScript = !dynamic && testScriptId ? this.testScripts[testScriptId] : null;
+    if (!dynamic && testScriptId && !testScript) throw new Error(`unknown test script: ${testScriptId}`);
     const charId = testScript?.characterId ?? characterId;
     const character = CHARACTERS[charId];
     if (!character) throw new Error(`unknown character: ${charId}`);
     const scenario = SCENARIOS.find((s) => s.id === scenarioId && s.open);
     if (!scenario) throw new Error(`scenario not open: ${scenarioId}`);
 
-    const schedule = testScript ? testScript.schedule : drawEvents(EVENT_LIST, charId, this.rng);
-    const base = createInitialState({ gameId: `g_${randomId(this.rng)}`, character, scenarioId, schedule });
+    const schedule = dynamic ? [] : testScript ? testScript.schedule : drawEvents(EVENT_LIST, charId, this.rng);
+    const base = createInitialState({ gameId: `g_${randomId(this.rng)}`, character, scenarioId, schedule, flow });
     this._testSource = null;
     this.state = {
       ...base,
@@ -162,6 +172,7 @@ export class GameController {
       scene: null,
       currentEventId: null,
       pendingAction: null,
+      pendingDice: null,
       lastError: null,
       eventLog: [],
       aiErrors: 0,
@@ -170,12 +181,46 @@ export class GameController {
       settled: false,
     };
     this.telemetry('game_start', { character_id: charId, mode: this.state.mode });
-    await this.#prepareRound();
+    try {
+      await this.#prepareRound();
+    } catch (e) {
+      this.abandon();
+      throw e instanceof SourceError ? e : new SourceError('provider', String(e?.message ?? e));
+    }
     return this.state;
   }
 
-  /** 抽出本回合事件、準備開場與三個選項（1.2 第 2 步） */
   async #prepareRound() {
+    return this.state.flow === 'dynamic' ? this.#prepareDynamicRound() : this.#prepareClassicRound();
+  }
+
+  /** AI 動態模式：第 1 回合由 AI 產生開場與選項；之後沿用上一回合 AI 給的選項，上一回合的結果就是開場 */
+  async #prepareDynamicRound() {
+    const s = this.state;
+    const fallback = fallbackOptions(s.characterId, s.round);
+    let opening = '';
+    let options = this.lastRecord?.options?.options;
+    if (s.history.length === 0) {
+      const res = await withTimeout(this.#sourceFor(s.mode).opening(s, null), this.timeoutMs);
+      opening = String(res?.opening ?? '');
+      options = sanitizeOptions(res?.options, fallback).options;
+    }
+    s.currentEventId = null;
+    s.scene = {
+      round: s.round,
+      opening,
+      event: null,
+      eventIntro: null,
+      options: options?.length === 3 ? options : fallback,
+    };
+    s.phase = 'awaiting_action';
+    s.pendingAction = null;
+    s.lastError = null;
+    this.#save();
+  }
+
+  /** 劇本模式：抽出本回合事件、準備開場與三個選項（1.2 第 2 步） */
+  async #prepareClassicRound() {
     const s = this.state;
     const pick = pickEventForRound(s.schedule, s.round, { world: s.world, milestones: s.milestones }, EVENTS);
     s.schedule = pick.schedule;
@@ -210,9 +255,8 @@ export class GameController {
 
   /**
    * @param {{type:'option', index:number, style:string, text:string} | {type:'free', text:string}} action
-   * @param {{forceScript?:boolean}} [opts] 本回合改用劇本（AI 故障備援，11.1）
    */
-  async act(action, { forceScript = false } = {}) {
+  async act(action) {
     const s = this.state;
     if (!s || !['awaiting_action', 'error'].includes(s.phase)) return { ok: false, error: 'not_ready' };
     if (!action) return { ok: false, error: 'empty_action' };
@@ -222,13 +266,16 @@ export class GameController {
       action = { type: 'free', text: clean };
     }
 
-    // 送出請求前先寫入 LocalStorage（10.5），並鎖定輸入（3.6）
+    const dynamic = s.flow === 'dynamic';
+    // 送出請求前先寫入 LocalStorage（10.5），並鎖定輸入（3.6）。
+    // 命運骰每回合只擲一次：重試、取消重選、重新整理都沿用同一個結果，不能靠重來洗運氣。
     s.pendingAction = action;
+    if (dynamic) s.pendingDice ??= rollLuck(this.rng, { round: s.round });
     s.phase = 'awaiting_ai';
     s.lastError = null;
     this.#save();
 
-    const source = forceScript ? this.sources.script : this.#sourceFor(s.mode);
+    const source = this.#sourceFor(s.mode);
     const event = this.currentEvent;
     const t0 = this.now();
     let response;
@@ -246,6 +293,8 @@ export class GameController {
       currentEvent: event,
       isFreeAction: action.type === 'free',
       fallbackOptions: fallbackOptions(s.characterId, round + 1),
+      flow: s.flow,
+      dice: s.pendingDice,
     });
     if (result.duplicate) return { ok: true, duplicate: true, record: result.record };
     if (!result.ok) {
@@ -264,7 +313,7 @@ export class GameController {
       elapsedMs: this.now() - t0,
       check: this.#checkTestScript(record),
     });
-    Object.assign(next, { pendingAction: null, lastError: null });
+    Object.assign(next, { pendingAction: null, pendingDice: null, lastError: null });
     this.state = next;
 
     this.telemetry('round_complete', {
@@ -308,12 +357,7 @@ export class GameController {
     return this.act(this.state?.pendingAction);
   }
 
-  /** 本回合改用劇本（10.5、11.1） */
-  useScriptThisRound() {
-    return this.act(this.state?.pendingAction, { forceScript: true });
-  }
-
-  /** 錯誤後放棄這次行動，回到選擇畫面 */
+  /** 錯誤後放棄這次行動，回到選擇畫面（命運骰保留，見 act） */
   cancelPending() {
     if (this.state?.phase !== 'error') return;
     this.state.phase = 'awaiting_action';
@@ -334,6 +378,10 @@ export class GameController {
 
   // ─── 結算（1.2 第 7 步、7.7） ──────────────────────────────
 
+  /**
+   * 劇本模式：AI 評語失敗 → 改用劇本評語，不阻擋分享（7.7）。
+   * AI 動態模式：失敗回傳 null 並記在 state.lastError，由玩家決定重試或放棄，不用罐頭評語頂替。
+   */
   async settle() {
     const s = this.state;
     if (!s || !['ended', 'settled'].includes(s.phase)) return null;
@@ -341,18 +389,25 @@ export class GameController {
 
     let comment = null;
     let commentSource = 'script';
+    let error = null;
     const source = this.#sourceFor(s.mode);
     try {
       comment = await withTimeout(source.settle(s), this.timeoutMs);
       commentSource = source.name;
-    } catch {
-      comment = null;
+    } catch (e) {
+      error = toError(e);
     }
     if (!comment?.personal_comment) {
-      // 結算呼叫失敗 → 改用劇本評語，不阻擋分享（7.7）
+      if (s.flow === 'dynamic') {
+        s.lastError = error ?? { code: 'schema', message: 'AI 評語為空' };
+        this.#save();
+        this.telemetry('ai_error', { type: s.lastError.code });
+        return null;
+      }
       comment = await this.sources.script.settle(s);
       commentSource = 'script';
     }
+    s.lastError = null;
     s.settlement = { ...getSettlement(s), comment, commentSource };
     s.phase = 'settled';
     s.settled = true;

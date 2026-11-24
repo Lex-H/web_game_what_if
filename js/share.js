@@ -1,7 +1,7 @@
 /**
  * 分享卡與分享流程（8.4、8.5）。
  *
- * - buildShareCard()：產生 1080×1920（9:16）暗色卡片 DOM。軌跡用 CSS 色塊，不用 emoji；
+ * - buildShareCard()：產生 1080×1920（9:16）卡片 DOM，顏色跟著目前主題。軌跡用 CSS 色塊，不用 emoji；
  *   只用系統字型；不使用外部圖片。樣式在 style.css 的 .sc- 前綴。
  * - renderCardPng()：用 html2canvas（window.html2canvas，vendor 自行託管）匯出 1080×1920 PNG。
  * - runShareFlow()：原生分享 → 內建瀏覽器彈窗 → 下載 + 複製 → 剪貼簿失敗顯示可全選文字框。
@@ -14,6 +14,7 @@ import { SYMBOLS } from './rules.js';
 import { CHARACTERS, SCENARIOS, STAT_LABELS, MILESTONE_STATUS_LABELS } from './scenarios.js';
 import { BADGE_LABELS, END_TYPE_LABELS } from './engine.js';
 import { isInAppBrowser } from './speech.js';
+import { themeColor } from './theme.js';
 
 export { isInAppBrowser };
 
@@ -140,7 +141,7 @@ export async function renderCardPng(card) {
       windowHeight: CARD_HEIGHT,
       scrollX: 0,
       scrollY: -window.scrollY,
-      backgroundColor: '#0d1117',
+      backgroundColor: themeColor('--bg', '#f4f6fa'),
       useCORS: false,
       allowTaint: false,
       logging: false,

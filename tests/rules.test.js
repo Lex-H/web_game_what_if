@@ -13,17 +13,25 @@ import {
   applyStatChanges,
   applyWorldStateChanges,
   authorizeRisk,
+  authorizeRiskByDice,
   computeScore,
   createInitialState,
   drawEvents,
+  FATAL_EARLIEST_ROUND,
   FATAL_TITLE,
   getClearRating,
+  getMoralRating,
+  getSettlement,
   getTitle,
+  normalizeMoralTag,
   parseResponseText,
   pickEventForRound,
   rejectionNotes,
   resolveRound,
+  rollLuck,
   SCORE_FAIL_TITLE,
+  tallyMoral,
+  TAINTED_CLEAR_TITLES,
   titleForScore,
   validateCharacterConfig,
 } from '../js/rules.js';
@@ -188,17 +196,17 @@ test('#2 四個里程碑全部 done → 顯示 100、通關、依 P + R 給評�
   eq(getClearRating(r.state).grade, 'A', '評級');
 });
 
-test('#3 S_raw = −30 → 提前失敗，稱號「亂世砲灰第一排」', () => {
-  const s = stateWith(CLERK, { round: 3, P: -25, R: 0 });
+test('#3 S_raw = −25 → 提前失敗（新門檻），稱號「亂世砲灰第一排」', () => {
+  const s = stateWith(CLERK, { round: 3, P: -20, R: 0 });
   const r = play(s, resp({ performance: 'poor' }), CLERK);
-  eq([r.state.scoreRaw, r.state.status, r.state.endType, r.record.symbol], [-30, 'failed', 'score', '💀']);
+  eq([r.state.scoreRaw, r.state.status, r.state.endType, r.record.symbol], [-25, 'failed', 'score', '💀']);
   eq(getTitle(r.state), SCORE_FAIL_TITLE);
 });
 
-test('#4 S_raw = −29 → 繼續遊戲', () => {
-  const s = stateWith(CLERK, { round: 3, P: -24, R: 0 });
+test('#4 S_raw = −24 → 繼續遊戲', () => {
+  const s = stateWith(CLERK, { round: 3, P: -19, R: 0 });
   const r = play(s, resp({ performance: 'poor' }), CLERK);
-  eq([r.state.scoreRaw, r.state.status, r.state.round], [-29, 'playing', 4]);
+  eq([r.state.scoreRaw, r.state.status, r.state.round], [-24, 'playing', 4]);
 });
 
 test('#5 經授權的 fatal，當時分數 84 → 立即失敗，fatal 專屬稱號', () => {
@@ -278,14 +286,27 @@ test('#15 同一回合 3 個里程碑前進 → 只接受陣列中前 2 個', ()
   eq(r.rejected[0].reason, 'advance_limit');
 });
 
-test('#16 本局第 5 次 excellent → 降為 good', () => {
+test('#16 本局第 5 次 excellent → 仍為 excellent（次數無上限）', () => {
   const r = applyPerformance('excellent', { excellent: 4, freeExcellent: 0 }, false);
-  eq([r.applied, r.points, r.note], ['good', 2, 'excellent_limit']);
+  eq([r.applied, r.points, r.note], ['excellent', 5, null]);
 });
 
-test('#17 自由行動第 3 次 excellent → 降為 good', () => {
+test('#17 自由行動第 3 次 excellent → 仍為 excellent（次數無上限）', () => {
   const r = applyPerformance('excellent', { excellent: 2, freeExcellent: 2 }, true);
-  eq([r.applied, r.note], ['good', 'free_excellent_limit']);
+  eq([r.applied, r.note], ['excellent', null]);
+});
+
+test('#16b computeScore 包含道德罰分：cruel 2 + selfish 1 → Moral = −32，raw 正確', () => {
+  const milestones = { m_supplies: 'none', m_contact: 'none', m_transport: 'none', m_arrive: 'none' };
+  const r = computeScore(milestones, CLERK.milestones, 15, 0, { cruel: 2, selfish: 1 });
+  eq(r.Moral, -32); // cruel 2×(-14)=-28, selfish 1×(-4)=-4
+  eq(r.raw, -17);  // 0 + 15 + 0 + (-32)
+});
+
+test('#17b authorizeRiskByDice：eventForced=true + AI 給 none → 保底 minor', () => {
+  const dice = { riskCeiling: 'major', eventForced: true };
+  const r = authorizeRiskByDice({ level: 'none' }, dice);
+  eq(r.level, 'minor');
 });
 
 test('#18 同一回合重複提交 → 不重複計分', () => {
@@ -592,6 +613,87 @@ test('validateCharacterConfig：正確設定通過；權重錯誤會被抓出來
   eq(validateCharacterConfig(CLERK, EVENT_LIST), []);
   const broken = { ...CLERK, milestones: CLERK.milestones.map((m, i) => (i === 0 ? { ...m, weight: 10 } : m)) };
   ok(validateCharacterConfig(broken, []).some((e) => e.includes('權重總和')));
+});
+
+// ─── 改版1：命運骰與道德後果（AI 動態模式） ──────────────────
+
+const fixed = (v) => () => v;
+const dice = (riskCeiling) => ({ roll: 0.5, tier: 'test', riskCeiling, eventForced: false });
+const DYN = { flow: 'dynamic' };
+
+test('rollLuck：各區間對應正確等級與風險上限', () => {
+  const at = (v, round = 5) => rollLuck(fixed(v), { round });
+  eq([at(0).tier, at(0).riskCeiling, at(0).eventForced], ['disaster', 'fatal', true]);
+  eq([at(0.049).tier, at(0.05).tier], ['disaster', 'bad']);
+  eq([at(0.1).riskCeiling, at(0.1).eventForced], ['major', true]);
+  eq([at(0.2).tier, at(0.2).riskCeiling, at(0.2).eventForced], ['neutral', 'minor', false]);
+  eq([at(0.8).tier, at(0.8).riskCeiling], ['good', 'none']);
+  eq([at(0.99).tier, at(0.99).riskCeiling], ['great', 'none']);
+});
+
+test('rollLuck：前兩回合 disaster 封頂為 major，第 3 回合起才可能 fatal', () => {
+  eq(rollLuck(fixed(0), { round: 1 }).riskCeiling, 'major');
+  eq(rollLuck(fixed(0), { round: 2 }).riskCeiling, 'major');
+  eq(rollLuck(fixed(0), { round: FATAL_EARLIEST_ROUND }).riskCeiling, 'fatal');
+});
+
+test('authorizeRiskByDice：只降不升，未超過上限原樣通過', () => {
+  const r1 = authorizeRiskByDice(risk('fatal'), dice('minor'));
+  eq([r1.proposed, r1.level, r1.downgraded, r1.notes], ['fatal', 'minor', true, ['over_dice_ceiling']]);
+  const r2 = authorizeRiskByDice(risk('none'), dice('fatal'));
+  eq([r2.level, r2.downgraded], ['none', false]);
+  const r3 = authorizeRiskByDice(risk('major'), dice('major'));
+  eq([r3.level, r3.downgraded, r3.eventId], ['major', false, null]);
+  eq(authorizeRiskByDice(risk('minor'), dice('none')).level, 'none');
+  eq(authorizeRiskByDice(risk('critical'), dice('fatal')).level, 'none');
+  eq(authorizeRiskByDice(risk('major'), undefined).level, 'minor');
+});
+
+test('resolveRound dynamic：骰子上限取代事件授權（無事件也能 major）', () => {
+  const s = createInitialState({ gameId: 'test', character: CLERK, flow: 'dynamic' });
+  eq(s.flow, 'dynamic');
+  const r = play(s, resp({ risk_event: risk('major') }), CLERK, { ...DYN, dice: dice('major') });
+  eq([r.record.risk.level, r.state.R, r.state.chargedEvents], ['major', -15, []]);
+  const r2 = play(s, resp({ risk_event: risk('fatal') }), CLERK, { ...DYN, dice: dice('minor') });
+  eq([r2.record.risk.level, r2.state.status], ['minor', 'playing']);
+});
+
+test('resolveRound classic：同樣的回應仍走事件授權（無事件 major → minor）', () => {
+  const s = createInitialState({ gameId: 'test', character: CLERK });
+  eq(s.flow, 'classic');
+  const r = play(s, resp({ risk_event: risk('major'), moral_tag: 'cruel' }), CLERK, { dice: dice('fatal') });
+  eq([r.record.risk.level, r.record.moral, r.state.counters.cruel], ['minor', undefined, undefined]);
+});
+
+test('tallyMoral / getMoralRating：門檻判斷，無效標籤視為 none', () => {
+  let c = { excellent: 0 };
+  c = tallyMoral(c, 'selfish');
+  eq([c.selfish, getMoralRating(c)], [1, 'clean']);
+  c = tallyMoral(c, 'selfish');
+  eq(getMoralRating(c), 'selfish');
+  c = tallyMoral(c, 'cruel');
+  eq([c.cruel, getMoralRating(c), c.excellent], [1, 'ruthless', 0]);
+  eq(tallyMoral({ selfish: 1 }, 'evil!!'), { selfish: 1 });
+  eq(normalizeMoralTag(undefined), 'none');
+});
+
+test('resolveRound dynamic：moral_tag 累計到 counters，致命回合也照算', () => {
+  const s = createInitialState({ gameId: 'test', character: CLERK, flow: 'dynamic' });
+  const r = play(s, resp({ moral_tag: 'selfish' }), CLERK, { ...DYN, dice: dice('none') });
+  eq([r.record.moral, r.state.counters.selfish], ['selfish', 1]);
+  const late = stateWith(CLERK, { flow: 'dynamic', round: 4 });
+  const f = play(late, resp({ moral_tag: 'cruel', risk_event: risk('fatal') }), CLERK, { ...DYN, dice: dice('fatal') });
+  eq([f.state.endType, f.record.frozen, f.state.counters.cruel], ['fatal', true, 1]);
+});
+
+test('通關但手段不乾淨 → 分數仍 100，稱號改用 TAINTED_CLEAR_TITLES', () => {
+  const allDone = { m_supplies: 'done', m_contact: 'done', m_transport: 'done', m_arrive: 'done' };
+  const base = { endType: 'clear', scoreDisplay: 100, P: 10, R: 0, endRound: 7, trajectory: [], milestones: allDone, stats: {} };
+  eq(getTitle({ ...base, counters: {} }), titleForScore(100));
+  eq(getTitle({ ...base, counters: { selfish: 2 } }), TAINTED_CLEAR_TITLES.selfish);
+  const st = getSettlement({ ...base, counters: { cruel: 1 } });
+  eq([st.score, st.title, st.moral], [100, TAINTED_CLEAR_TITLES.ruthless, 'ruthless']);
+  eq(getTitle({ ...base, endType: 'fatal', counters: { cruel: 3 } }), FATAL_TITLE);
 });
 
 // ─── 輸出結果（Node 與瀏覽器都能用） ─────────────────────────

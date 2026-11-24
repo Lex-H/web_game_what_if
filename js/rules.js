@@ -12,16 +12,16 @@
  *   - AI 的建議只會被「拒絕」或「降級」，絕不會被升級。
  */
 
-export const RULES_VERSION = '2.1.0';
+export const RULES_VERSION = '2.2.0';
 
 // ─── 常數（數字來源見文件章節） ────────────────────────────────
 
 export const MAX_ROUNDS = 7; // 第六章
-export const FAIL_SCORE = -30; // 3.4：S_raw ≤ −30 提前失敗
+export const FAIL_SCORE = -25; // 3.4：S_raw ≤ −25 提前失敗
 export const UNFINISHED_SCORE_CAP = 99; // 3.4：未全部完成時顯示上限
 export const CLEAR_SCORE = 100;
-export const EXCELLENT_MAX = 4; // 3.2：每局 excellent 上限
-export const FREE_EXCELLENT_MAX = 2; // 3.2：自由行動 excellent 上限
+export const MORAL_PENALTY_CRUEL = -14; // 每次 cruel 行為的分數代價
+export const MORAL_PENALTY_SELFISH = -4; // 每次 selfish 行為的分數代價
 export const MAX_ADVANCES_PER_ROUND = 2; // 4.1：每回合最多 2 個里程碑前進
 export const STAT_DELTA_LIMIT = 2; // 7.5：stat_changes 範圍 −2～+2
 export const STAT_STEP = 5; // 8.2：前端乘以 5
@@ -115,15 +115,18 @@ export function isUnwinnable(milestones, defs) {
 }
 
 /**
- * S_raw = M + P + R；S_display 在全部完成時為 100，否則最高 99（3.4）。
+ * S_raw = M + P + R + Moral；S_display 在全部完成時為 100，否則最高 99（3.4）。
  * 負分照實保留，稱號判定時才以 0 計算。
+ * counters 含 cruel / selfish 計數，計算道德代價（AI 動態模式才有，classic 傳空物件）。
  */
-export function computeScore(milestones, defs, P, R) {
+export function computeScore(milestones, defs, P, R, counters = {}) {
   const M = computeMilestoneScore(milestones, defs);
-  const raw = M + P + R;
+  const Moral = (counters.cruel ?? 0) * MORAL_PENALTY_CRUEL
+              + (counters.selfish ?? 0) * MORAL_PENALTY_SELFISH;
+  const raw = M + P + R + Moral;
   const cleared = allMilestonesDone(milestones, defs);
   const display = cleared ? CLEAR_SCORE : Math.min(raw, UNFINISHED_SCORE_CAP);
-  return { M, P, R, raw, display, cleared, locked: !cleared && raw > UNFINISHED_SCORE_CAP };
+  return { M, P, R, Moral, raw, display, cleared, locked: !cleared && raw > UNFINISHED_SCORE_CAP };
 }
 
 // ─── 4.2 風險授權與降級 ───────────────────────────────────────
@@ -181,6 +184,68 @@ export function authorizeRisk(risk, currentEvent, chargedEvents = []) {
     downgraded: level !== proposed,
     notes,
   };
+}
+
+// ─── 改版1 §3.1 命運骰（AI 動態模式） ────────────────────────
+
+export const FLOWS = Object.freeze(['classic', 'dynamic']);
+
+/** roll 落在 [前一級 max, max) 即為該級；玩家看不到任何數值 */
+export const LUCK_TIERS = Object.freeze([
+  { id: 'disaster', max: 0.05, riskCeiling: 'fatal', eventForced: true },
+  { id: 'bad', max: 0.2, riskCeiling: 'major', eventForced: true },
+  { id: 'neutral', max: 0.75, riskCeiling: 'minor', eventForced: false },
+  { id: 'good', max: 0.95, riskCeiling: 'none', eventForced: false },
+  { id: 'great', max: 1, riskCeiling: 'none', eventForced: false },
+]);
+
+/** 前兩回合就暴斃太不公平：disaster 在此之前封頂為 major */
+export const FATAL_EARLIEST_ROUND = 3;
+
+export function rollLuck(rng = Math.random, { round = 1 } = {}) {
+  const roll = rng();
+  const tier = LUCK_TIERS.find((t) => roll < t.max) ?? LUCK_TIERS.at(-1);
+  const riskCeiling = tier.riskCeiling === 'fatal' && round < FATAL_EARLIEST_ROUND ? 'major' : tier.riskCeiling;
+  return { roll, tier: tier.id, riskCeiling, eventForced: tier.eventForced };
+}
+
+/** 骰子決定本回合風險上限，AI 的建議只降不升；eventForced=true 時保底 minor */
+export function authorizeRiskByDice(risk, dice) {
+  const proposed = RISK_LEVELS.includes(risk?.level) ? risk.level : 'none';
+  const ceiling = RISK_LEVELS.includes(dice?.riskCeiling) ? dice.riskCeiling : 'minor';
+  const over = riskRank(proposed) > riskRank(ceiling);
+  let level = over ? ceiling : proposed;
+  // eventForced=true 時引擎強制至少 minor，AI 給 none 一律升為 minor
+  if (dice?.eventForced && riskRank(level) < riskRank('minor')) level = 'minor';
+  return { proposed, level, eventId: null, downgraded: over, notes: over ? ['over_dice_ceiling'] : [] };
+}
+
+// ─── 改版1 §3.2 道德後果（AI 動態模式） ──────────────────────
+
+export const MORAL_TAGS = Object.freeze(['none', 'selfish', 'cruel']);
+export const SELFISH_THRESHOLD = 2;
+export const CRUEL_THRESHOLD = 1;
+
+/** 通關但手段不乾淨：分數照算，稱號不美化 */
+export const TAINTED_CLEAR_TITLES = Object.freeze({
+  selfish: '活下來了，但最好別問怎麼活下來的',
+  ruthless: '踩著別人的肩膀笑著抵達終點',
+});
+
+export const normalizeMoralTag = (tag) => (MORAL_TAGS.includes(tag) ? tag : 'none');
+
+export function tallyMoral(counters, tag) {
+  const t = normalizeMoralTag(tag);
+  if (t === 'none') return { ...counters };
+  const key = t === 'cruel' ? 'cruel' : 'selfish';
+  return { ...counters, [key]: (counters?.[key] ?? 0) + 1 };
+}
+
+/** @returns {'clean'|'selfish'|'ruthless'} */
+export function getMoralRating(counters) {
+  if ((counters?.cruel ?? 0) >= CRUEL_THRESHOLD) return 'ruthless';
+  if ((counters?.selfish ?? 0) >= SELFISH_THRESHOLD) return 'selfish';
+  return 'clean';
 }
 
 // ─── 4.1 里程碑狀態轉移 ───────────────────────────────────────
@@ -265,23 +330,15 @@ export function applyMilestoneUpdates(milestonesAtStart, updates, defs, riskLeve
 
 // ─── 3.2 表現分 ───────────────────────────────────────────────
 
-/** 套用表現評價；超過 excellent 上限時降為 good（3.2） */
+/** 套用表現評價；excellent 次數無上限（3.2） */
 export function applyPerformance(proposed, counters, isFreeAction = false) {
   const next = { excellent: 0, freeExcellent: 0, ...counters };
   let applied = proposed;
   let note = null;
 
   if (proposed === 'excellent') {
-    if (next.excellent >= EXCELLENT_MAX) {
-      applied = 'good';
-      note = 'excellent_limit';
-    } else if (isFreeAction && next.freeExcellent >= FREE_EXCELLENT_MAX) {
-      applied = 'good';
-      note = 'free_excellent_limit';
-    } else {
-      next.excellent += 1;
-      if (isFreeAction) next.freeExcellent += 1;
-    }
+    next.excellent += 1;
+    if (isFreeAction) next.freeExcellent += 1;
   }
 
   return {
@@ -647,11 +704,12 @@ export function trajectorySymbol({ outcome, riskLevel, deltaRaw }) {
  * @param {{gameId:string, character:object, scenarioId?:string, schedule?:Array}} params
  *   schedule 為 drawEvents() 的結果（5.1 的 scheduled_events，不傳給 AI）
  */
-export function createInitialState({ gameId, character, scenarioId = null, schedule = [] }) {
+export function createInitialState({ gameId, character, scenarioId = null, schedule = [], flow = 'classic' }) {
   return {
     rulesVersion: RULES_VERSION,
     gameId,
     scenarioId,
+    flow: FLOWS.includes(flow) ? flow : 'classic',
     characterId: character.id,
     status: 'playing', // playing | cleared | failed | ended
     endType: null, // clear | fatal | score | normal
@@ -662,6 +720,7 @@ export function createInitialState({ gameId, character, scenarioId = null, sched
     M: 0,
     P: 0,
     R: 0,
+    Moral: 0,
     scoreRaw: 0,
     scoreDisplay: 0,
     locked: false,
@@ -690,6 +749,8 @@ export function createInitialState({ gameId, character, scenarioId = null, sched
  * @param {object|null} [ctx.currentEvent] 本回合事件
  * @param {boolean} [ctx.isFreeAction] 玩家本回合是否使用自由行動
  * @param {Array} [ctx.fallbackOptions] 選項不合法時的備援選項
+ * @param {'classic'|'dynamic'} [ctx.flow] dynamic 時改用命運骰授權風險並累計 moral_tag
+ * @param {object} [ctx.dice] rollLuck() 的結果（dynamic 才需要）
  * @returns {{ok:boolean, duplicate?:boolean, error?:string, errors?:string[], state:object, record?:object}}
  */
 export function resolveRound(state, response, ctx) {
@@ -716,7 +777,10 @@ export function resolveRound(state, response, ctx) {
   const next = clone(state);
   const before = { raw: state.scoreRaw, display: state.scoreDisplay };
 
-  const risk = authorizeRisk(response.risk_event, event, state.chargedEvents);
+  const dynamic = ctx.flow === 'dynamic';
+  const risk = dynamic
+    ? authorizeRiskByDice(response.risk_event, ctx.dice)
+    : authorizeRisk(response.risk_event, event, state.chargedEvents);
   if (risk.eventId && !next.chargedEvents.includes(risk.eventId)) next.chargedEvents.push(risk.eventId);
   if (event && !next.knownEvents.includes(event.id)) next.knownEvents.push(event.id);
 
@@ -769,9 +833,17 @@ export function resolveRound(state, response, ctx) {
     record.options = sanitizeOptions(response.options, ctx.fallbackOptions);
   }
 
-  const after = computeScore(next.milestones, defs, next.P, next.R);
+  if (dynamic) {
+    // 致命回合的惡行一樣算數，所以放在 frozen 判斷之外
+    record.dice = ctx.dice ?? null;
+    record.moral = normalizeMoralTag(response.moral_tag);
+    next.counters = tallyMoral(next.counters, record.moral);
+  }
+
+  const after = computeScore(next.milestones, defs, next.P, next.R, next.counters);
   Object.assign(next, {
     M: after.M,
+    Moral: after.Moral,
     scoreRaw: after.raw,
     scoreDisplay: after.display,
     locked: after.locked,
@@ -834,6 +906,8 @@ export function titleForScore(score) {
 export function getTitle(state) {
   if (state.endType === 'fatal') return FATAL_TITLE;
   if (state.endType === 'score') return SCORE_FAIL_TITLE;
+  const moral = getMoralRating(state.counters);
+  if (state.endType === 'clear' && moral !== 'clean') return TAINTED_CLEAR_TITLES[moral];
   return titleForScore(state.scoreDisplay);
 }
 
@@ -859,6 +933,7 @@ export function getSettlement(state) {
     score: state.scoreDisplay,
     title: getTitle(state),
     rating: getClearRating(state),
+    moral: getMoralRating(state.counters),
     trajectory: state.trajectory.join(''),
     milestones: { ...state.milestones },
     stats: { ...state.stats },
